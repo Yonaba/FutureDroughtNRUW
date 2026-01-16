@@ -167,6 +167,53 @@ calib_results <- tibble(station = character(), month = integer(), c1 = numeric()
 plot_list <- list()
 label_n <- -1
 
+# --- Before the station loop --------------------------------------------
+
+cv_results <- tibble(
+  station = character(),
+  fold = integer(),
+  rmse = numeric(),
+  r = numeric()
+)
+
+# Final fit (full series) coefficients (12 rows per station)
+calib_results <- tibble(
+  station = character(),
+  month = integer(),
+  c1 = numeric(),
+  c2 = numeric(),
+  c3 = numeric(),
+  c4 = numeric()
+)
+
+# NEW: store fold-specific monthly coefs for uncertainty (12 * K_FOLDS per station)
+cv_monthly_coefs <- tibble(
+  station = character(),
+  fold = integer(),
+  month = integer(),
+  c1 = numeric(),
+  c2 = numeric(),
+  c3 = numeric(),
+  c4 = numeric()
+)
+
+# Helper to format "value [min - max]"
+fmt_value_range <- function(x_final, x_min, x_max, digits = 4) {
+  if (!is.finite(x_final) || !is.finite(x_min) || !is.finite(x_max)) {
+    return(NA_character_)
+  }
+  
+  paste0(
+    formatC(x_final, format = "f", digits = digits),
+    " [",
+    formatC(x_min, format = "f", digits = digits),
+    " - ",
+    formatC(x_max, format = "f", digits = digits),
+    "]"
+  )
+}
+
+
 # --- Loop stations -------------------------------------------------------
 
 for (station in rownames(stations)) {
@@ -205,9 +252,26 @@ for (station in rownames(stations)) {
     train_data <- df[-test_idx, ]
     
     res <- fit_hargreaves_nls_monthly(train_data, test_data)
+    
     cv_results <- bind_rows(
       cv_results,
-      tibble(station = station, Fold = i, RMSE = res$metrics["RMSE"], R = res$metrics["R"])
+      tibble(
+        station = station,
+        fold = i,
+        rmse = res$metrics[["RMSE"]],
+        r = res$metrics[["R"]]
+      )
+    )
+    
+    cv_monthly_coefs <- bind_rows(
+      cv_monthly_coefs,
+      res$coefs |>
+        transmute(
+          station = station,
+          fold = i,
+          month = month_id,
+          c1, c2, c3, c4
+        )
     )
   }
   
@@ -235,6 +299,41 @@ for (station in rownames(stations)) {
 
 write.csv(cv_results, file = "output/tables/1_cv_pet_hs_monthly.csv", row.names = FALSE)
 write.csv(calib_results, file = "output/tables/1_calibrated_pet_hs_coefs_monthly.csv", row.names = FALSE)
+
+uncertainty_ranges <- cv_monthly_coefs |>
+  group_by(station, month) |>
+  summarise(
+    c1_min = min(c1, na.rm = TRUE),
+    c1_max = max(c1, na.rm = TRUE),
+    c2_min = min(c2, na.rm = TRUE),
+    c2_max = max(c2, na.rm = TRUE),
+    c3_min = min(c3, na.rm = TRUE),
+    c3_max = max(c3, na.rm = TRUE),
+    c4_min = min(c4, na.rm = TRUE),
+    c4_max = max(c4, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  # if all values were NA for a month, min/max become Inf/-Inf; fix to NA
+  mutate(across(ends_with("_min"), \(x) ifelse(is.infinite(x), NA_real_, x))) |>
+  mutate(across(ends_with("_max"), \(x) ifelse(is.infinite(x), NA_real_, x)))
+
+uncertainty_table <- calib_results |>
+  select(station, month, c1, c2, c3, c4) |>
+  left_join(uncertainty_ranges, by = c("station", "month")) |>
+  mutate(
+    c1 = purrr::pmap_chr(list(c1, c1_min, c1_max, 5), fmt_value_range),
+    c2 = purrr::pmap_chr(list(c2, c2_min, c2_max, 2), fmt_value_range),
+    c3 = purrr::pmap_chr(list(c3, c3_min, c3_max, 2), fmt_value_range),
+    c4 = purrr::pmap_chr(list(c4, c4_min, c4_max, 1), fmt_value_range)
+  ) |>
+  select(station, month, c1, c2, c3, c4) |>
+  arrange(station, month)
+
+write.csv(
+  uncertainty_table,
+  "output/tables/1_calibrated_pet_hs_coefs_monthly_ranges_3fold.csv",
+  row.names = FALSE
+)
 
 # Keep your 4-panel aggregation if you still want just the first two stations
 if (length(plot_list) >= 4) {
